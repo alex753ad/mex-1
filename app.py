@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════
-  MEXC Density Scanner — Streamlit Dashboard v2.1
+  MEXC Density Scanner — Streamlit Dashboard v2.3
 ═══════════════════════════════════════════════════════════
 """
 import io
@@ -38,27 +38,26 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════
-# Session State
-# ═══════════════════════════════════════════════════
-
-DEFAULTS = {
-    "tracker": DensityTracker(),
-    "scan_results": [],
-    "scan_df": pd.DataFrame(),
-    "last_scan": 0.0,
-    "total_pairs": 0,
-    "client": MexcClientSync(),
-    "detail_symbol": "",
-    "nav_page": "📊 Сканер плотностей",
-}
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-# ═══════════════════════════════════════════════════
 # Утилиты
 # ═══════════════════════════════════════════════════
+
+def sf(val, default=0.0):
+    """safe float — MEXC может вернуть '', None, list и т.д."""
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def si(val, default=0):
+    """safe int"""
+    try:
+        return int(sf(val, default))
+    except (ValueError, TypeError):
+        return default
+
 
 def mexc_link(symbol: str) -> str:
     return f"https://www.mexc.com/exchange/{symbol.replace('USDT', '_USDT')}"
@@ -68,155 +67,213 @@ def make_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def go_to_detail(symbol: str):
-    st.session_state.detail_symbol = symbol
-    st.session_state.nav_page = "🔍 Детальный разбор"
-    st.rerun()
-
-
 def count_trades_in_window(trades: list, window_minutes: int) -> int:
     if not trades:
         return 0
     now_ms = int(time.time() * 1000)
     cutoff = now_ms - window_minutes * 60 * 1000
-    return sum(1 for t in trades if t.get("time", 0) >= cutoff)
+    return sum(1 for t in trades if sf(t.get("time", 0)) >= cutoff)
 
 
-# ───── Графики ─────
+def extract_trade_count(ticker_data: dict) -> int:
+    """Извлечь количество сделок — MEXC хранит в разных полях"""
+    for key in ("count", "tradeCount", "trades", "txcnt"):
+        v = ticker_data.get(key)
+        if v is None or v == "" or v == 0 or v == "0":
+            continue
+        result = si(v)
+        if result > 0:
+            return result
+    return 0
+
+
+# ═══════════════════════════════════════════════════
+# Session State
+# ═══════════════════════════════════════════════════
+
+if "tracker" not in st.session_state:
+    st.session_state.tracker = DensityTracker()
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = []
+if "scan_df" not in st.session_state:
+    st.session_state.scan_df = pd.DataFrame()
+if "last_scan" not in st.session_state:
+    st.session_state.last_scan = 0.0
+if "total_pairs" not in st.session_state:
+    st.session_state.total_pairs = 0
+if "client" not in st.session_state:
+    st.session_state.client = MexcClientSync()
+if "detail_symbol" not in st.session_state:
+    st.session_state.detail_symbol = ""
+# Навигация — отдельная переменная, НЕ привязанная к виджету
+if "target_page" not in st.session_state:
+    st.session_state.target_page = 0
+
+
+# ═══════════════════════════════════════════════════
+# Графики
+# ═══════════════════════════════════════════════════
 
 def build_candlestick_chart(klines, symbol, interval, current_price=None):
-    if not klines:
+    if not klines or len(klines) < 2:
         return None
-    df = pd.DataFrame(klines, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
-    ])
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+    try:
+        rows = []
+        for k in klines:
+            if len(k) < 6:
+                continue
+            rows.append({
+                "open_time": sf(k[0]),
+                "open": sf(k[1]), "high": sf(k[2]),
+                "low": sf(k[3]), "close": sf(k[4]),
+                "volume": sf(k[5]),
+            })
+        if len(rows) < 2:
+            return None
+        df = pd.DataFrame(rows)
+        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.03, row_heights=[0.75, 0.25],
-    )
-    fig.add_trace(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"],
-        increasing_line_color="#00c853", decreasing_line_color="#ff1744",
-        name="Цена",
-    ), row=1, col=1)
-
-    colors = ["#00c853" if c >= o else "#ff1744"
-              for c, o in zip(df["close"], df["open"])]
-    fig.add_trace(go.Bar(
-        x=df["time"], y=df["volume"],
-        marker_color=colors, opacity=0.5, name="Объём",
-    ), row=2, col=1)
-
-    if current_price:
-        fig.add_hline(
-            y=current_price, line_dash="dot",
-            line_color="#00d2ff", line_width=1.5,
-            annotation_text=f"  {current_price:.8g}",
-            annotation_font_color="#00d2ff",
-            annotation_font_size=11,
-            row=1, col=1,
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.03, row_heights=[0.75, 0.25],
         )
+        fig.add_trace(go.Candlestick(
+            x=df["time"], open=df["open"], high=df["high"],
+            low=df["low"], close=df["close"],
+            increasing_line_color="#00c853",
+            decreasing_line_color="#ff1744",
+            name="Цена",
+        ), row=1, col=1)
 
-    fig.update_layout(
-        title=f"{symbol} — {interval}",
-        template="plotly_dark", height=420,
-        xaxis_rangeslider_visible=False,
-        showlegend=False,
-        margin=dict(l=50, r=20, t=40, b=20),
-    )
-    fig.update_yaxes(title_text="Цена", row=1, col=1)
-    fig.update_yaxes(title_text="Объём", row=2, col=1)
-    return fig
+        colors = ["#00c853" if c >= o else "#ff1744"
+                  for c, o in zip(df["close"], df["open"])]
+        fig.add_trace(go.Bar(
+            x=df["time"], y=df["volume"],
+            marker_color=colors, opacity=0.5, name="Объём",
+        ), row=2, col=1)
+
+        if current_price and current_price > 0:
+            fig.add_hline(
+                y=current_price, line_dash="dot",
+                line_color="#00d2ff", line_width=1.5,
+                annotation_text=f"  {current_price:.8g}",
+                annotation_font_color="#00d2ff",
+                annotation_font_size=11,
+                row=1, col=1,
+            )
+
+        fig.update_layout(
+            title=f"{symbol} — {interval}",
+            template="plotly_dark", height=420,
+            xaxis_rangeslider_visible=False,
+            showlegend=False,
+            margin=dict(l=50, r=20, t=40, b=20),
+        )
+        fig.update_yaxes(title_text="Цена", row=1, col=1)
+        fig.update_yaxes(title_text="Объём", row=2, col=1)
+        return fig
+    except Exception as e:
+        st.caption(f"Ошибка графика: {e}")
+        return None
 
 
 def build_orderbook_chart(bids_raw, asks_raw, current_price, depth=50):
-    bid_data = [(float(p), float(p) * float(q)) for p, q in bids_raw[:depth]]
-    ask_data = [(float(p), float(p) * float(q)) for p, q in asks_raw[:depth]]
+    try:
+        bid_data = [(sf(p), sf(p) * sf(q))
+                    for p, q in bids_raw[:depth] if sf(p) > 0]
+        ask_data = [(sf(p), sf(p) * sf(q))
+                    for p, q in asks_raw[:depth] if sf(p) > 0]
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        y=[f"{p:.8g}" for p, _ in bid_data],
-        x=[v for _, v in bid_data],
-        orientation="h", name="BID",
-        marker_color="rgba(0,200,83,0.7)",
-        hovertemplate="Цена: %{y}<br>$%{x:,.0f}<extra>BID</extra>",
-    ))
-    fig.add_trace(go.Bar(
-        y=[f"{p:.8g}" for p, _ in ask_data],
-        x=[v for _, v in ask_data],
-        orientation="h", name="ASK",
-        marker_color="rgba(255,23,68,0.7)",
-        hovertemplate="Цена: %{y}<br>$%{x:,.0f}<extra>ASK</extra>",
-    ))
-    fig.add_hline(
-        y=f"{current_price:.8g}",
-        line_dash="dot", line_color="#00d2ff", line_width=2,
-        annotation_text=f"  ← {current_price:.8g}",
-        annotation_font_color="#00d2ff",
-        annotation_position="top right",
-    )
-    fig.update_layout(
-        title="📖 Стакан (USDT)",
-        xaxis_title="Объём ($)",
-        template="plotly_dark",
-        height=max(500, depth * 14),
-        barmode="relative", showlegend=True,
-        yaxis=dict(type="category"),
-        margin=dict(l=80, r=20, t=40, b=30),
-    )
-    return fig
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=[f"{p:.8g}" for p, _ in bid_data],
+            x=[v for _, v in bid_data],
+            orientation="h", name="BID",
+            marker_color="rgba(0,200,83,0.7)",
+            hovertemplate="Цена: %{y}<br>$%{x:,.0f}<extra>BID</extra>",
+        ))
+        fig.add_trace(go.Bar(
+            y=[f"{p:.8g}" for p, _ in ask_data],
+            x=[v for _, v in ask_data],
+            orientation="h", name="ASK",
+            marker_color="rgba(255,23,68,0.7)",
+            hovertemplate="Цена: %{y}<br>$%{x:,.0f}<extra>ASK</extra>",
+        ))
+        if current_price and current_price > 0:
+            fig.add_hline(
+                y=f"{current_price:.8g}",
+                line_dash="dot", line_color="#00d2ff", line_width=2,
+                annotation_text=f"  ← {current_price:.8g}",
+                annotation_font_color="#00d2ff",
+                annotation_position="top right",
+            )
+        fig.update_layout(
+            title="📖 Стакан (USDT)",
+            xaxis_title="Объём ($)",
+            template="plotly_dark",
+            height=max(500, depth * 14),
+            barmode="relative", showlegend=True,
+            yaxis=dict(type="category"),
+            margin=dict(l=80, r=20, t=40, b=30),
+        )
+        return fig
+    except Exception as e:
+        st.caption(f"Ошибка стакана: {e}")
+        return None
 
 
 def build_heatmap(bids_raw, asks_raw, current_price, depth=30):
-    levels = []
-    for p, q in bids_raw[:depth]:
-        pr, vol = float(p), float(p) * float(q)
-        levels.append(("BID", pr, vol))
-    for p, q in asks_raw[:depth]:
-        pr, vol = float(p), float(p) * float(q)
-        levels.append(("ASK", pr, vol))
-    if not levels:
+    try:
+        levels = []
+        for p, q in bids_raw[:depth]:
+            pr, vol = sf(p), sf(p) * sf(q)
+            if pr > 0:
+                levels.append(("BID", pr, vol))
+        for p, q in asks_raw[:depth]:
+            pr, vol = sf(p), sf(p) * sf(q)
+            if pr > 0:
+                levels.append(("ASK", pr, vol))
+        if not levels:
+            return None
+
+        levels.sort(key=lambda x: x[1], reverse=True)
+        max_vol = max(v for _, _, v in levels) if levels else 1
+        if max_vol <= 0:
+            max_vol = 1
+
+        fig = go.Figure()
+        for side, price, vol in levels:
+            intensity = vol / max_vol
+            if side == "BID":
+                r, g, b = 0, int(80 + 175 * intensity), 83
+            else:
+                r, g, b = int(80 + 175 * intensity), int(60 * (1 - intensity)), 68
+            fig.add_trace(go.Bar(
+                x=[vol], y=[f"{price:.8g}"],
+                orientation="h",
+                marker_color=f"rgba({r},{g},{b},0.85)",
+                showlegend=False,
+                hovertemplate=f"{side}: ${vol:,.0f}<extra>{price:.8g}</extra>",
+            ))
+        if current_price and current_price > 0:
+            fig.add_hline(
+                y=f"{current_price:.8g}",
+                line_dash="dot", line_color="#00d2ff", line_width=2,
+                annotation_text=f"  ← {current_price:.8g}",
+                annotation_font_color="#00d2ff",
+            )
+        fig.update_layout(
+            title="🔥 Хитмап плотностей",
+            template="plotly_dark", height=500,
+            barmode="stack",
+            yaxis=dict(type="category"),
+            xaxis_title="Объём (USDT)",
+            margin=dict(l=80, r=20, t=40, b=30),
+        )
+        return fig
+    except Exception as e:
+        st.caption(f"Ошибка хитмапа: {e}")
         return None
-
-    levels.sort(key=lambda x: x[1], reverse=True)
-    max_vol = max(v for _, _, v in levels)
-
-    fig = go.Figure()
-    for side, price, vol in levels:
-        intensity = vol / max_vol if max_vol > 0 else 0
-        if side == "BID":
-            r, g, b = 0, int(80 + 175 * intensity), 83
-        else:
-            r, g, b = int(80 + 175 * intensity), int(60 * (1 - intensity)), 68
-        fig.add_trace(go.Bar(
-            x=[vol], y=[f"{price:.8g}"],
-            orientation="h",
-            marker_color=f"rgba({r},{g},{b},0.85)",
-            showlegend=False,
-            hovertemplate=f"{side}: ${vol:,.0f}<extra>{price:.8g}</extra>",
-        ))
-    fig.add_hline(
-        y=f"{current_price:.8g}",
-        line_dash="dot", line_color="#00d2ff", line_width=2,
-        annotation_text=f"  ← {current_price:.8g}",
-        annotation_font_color="#00d2ff",
-    )
-    fig.update_layout(
-        title="🔥 Хитмап плотностей",
-        template="plotly_dark", height=500,
-        barmode="stack",
-        yaxis=dict(type="category"),
-        xaxis_title="Объём (USDT)",
-        margin=dict(l=80, r=20, t=40, b=30),
-    )
-    return fig
 
 
 # ═══════════════════════════════════════════════════
@@ -234,60 +291,110 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
     client = st.session_state.client
     progress = st.progress(0, "Загрузка списка пар...")
 
-    info = client.get_exchange_info()
+    try:
+        info = client.get_exchange_info()
+    except Exception as e:
+        st.error(f"Ошибка API exchangeInfo: {e}")
+        return
+
     if not info or "symbols" not in info:
         st.error("Не удалось загрузить список пар MEXC")
         return
-    all_symbols = [
-        s["symbol"] for s in info["symbols"]
-        if s.get("quoteAsset") == "USDT"
-        and s.get("isSpotTradingAllowed", True)
-        and s.get("status") == "1"
-    ]
-    progress.progress(10, f"{len(all_symbols)} USDT-пар. Фильтрую...")
 
-    tickers = client.get_all_tickers_24h()
+    all_symbols = []
+    for s in info["symbols"]:
+        try:
+            if (s.get("quoteAsset") == "USDT"
+                    and s.get("status") in ("1", "ENABLED", 1, True)
+                    and s.get("isSpotTradingAllowed", True)):
+                all_symbols.append(s["symbol"])
+        except Exception:
+            continue
+
+    if not all_symbols:
+        st.error("Не нашлось USDT-пар")
+        return
+
+    progress.progress(10, f"{len(all_symbols)} USDT-пар...")
+
+    try:
+        tickers = client.get_all_tickers_24h()
+    except Exception as e:
+        st.error(f"Ошибка API tickers: {e}")
+        return
+
     if not tickers:
         st.error("Не удалось загрузить тикеры")
         return
-    ticker_map = {t["symbol"]: t for t in tickers if "symbol" in t}
+
+    ticker_map = {}
+    for t in tickers:
+        sym = t.get("symbol")
+        if sym:
+            ticker_map[sym] = t
 
     candidates = []
     for sym in all_symbols:
         t = ticker_map.get(sym)
         if not t:
             continue
-        vol = float(t.get("quoteVolume", 0))
+        vol = sf(t.get("quoteVolume", 0))
         if min_vol <= vol <= max_vol:
             candidates.append((sym, t))
-    candidates.sort(key=lambda x: float(x[1].get("quoteVolume", 0)), reverse=True)
+    candidates.sort(key=lambda x: sf(x[1].get("quoteVolume", 0)), reverse=True)
+
+    if not candidates:
+        st.warning(f"Нет пар ${min_vol:,}–${max_vol:,}. Расширь диапазон.")
+        progress.empty()
+        return
+
     progress.progress(20, f"Сканирую ({len(candidates)} пар)...")
 
     results = []
+    errors = 0
     total = len(candidates)
     for i, (sym, ticker) in enumerate(candidates):
-        book = client.get_order_book(sym, cfg.ORDER_BOOK_DEPTH)
-        if book:
-            result = analyze_order_book(sym, book, ticker)
-            if result and result.spread_pct >= min_spread:
-                try:
-                    result.trade_count_24h = int(float(ticker.get("count", 0) or 0))
-                except (ValueError, TypeError):
-                    result.trade_count_24h = 0
-                results.append(result)
+        try:
+            book = client.get_order_book(sym, cfg.ORDER_BOOK_DEPTH)
+            if book:
+                result = analyze_order_book(sym, book, ticker)
+                if result and result.spread_pct >= min_spread:
+                    result.trade_count_24h = extract_trade_count(ticker)
+                    results.append(result)
+        except Exception:
+            errors += 1
+
         if (i + 1) % 5 == 0 or i == total - 1:
             pct = 20 + int((i + 1) / total * 75)
             progress.progress(pct, f"{i+1}/{total} | Найдено: {len(results)}")
             time.sleep(0.02)
 
-    new_movers = st.session_state.tracker.update(results)
+    # ─── Попробуем загрузить trade count для топовых пар ───
+    # Bulk endpoint часто не содержит count, подгружаем индивидуально
     results.sort(key=lambda r: r.score, reverse=True)
     top_results = results[:top_n]
 
+    progress.progress(96, "Загрузка сделок...")
+    loaded_count = 0
+    for r in top_results:
+        if r.trade_count_24h == 0:
+            try:
+                individual = client.get_ticker_24h(r.symbol)
+                if individual and isinstance(individual, (dict, list)):
+                    # MEXC может вернуть список из одного элемента
+                    td = individual[0] if isinstance(individual, list) else individual
+                    r.trade_count_24h = extract_trade_count(td)
+                    loaded_count += 1
+            except Exception:
+                pass
+    if loaded_count:
+        progress.progress(98, f"Загружены сделки для {loaded_count} пар")
+
+    new_movers = st.session_state.tracker.update(top_results)
+
     rows = []
     for r in top_results:
-        biggest = r.biggest_wall
-        if not biggest:
+        if not r.all_walls:
             continue
         bid_str = " | ".join(
             f"${w.size_usdt:,.0f} ({w.multiplier}x, -{w.distance_pct}%)"
@@ -300,7 +407,7 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
             "Пара": r.symbol,
             "Спред %": round(r.spread_pct, 2),
             "Объём 24ч $": round(r.volume_24h_usdt),
-            "Сделок 24ч": getattr(r, "trade_count_24h", 0),
+            "Сделок 24ч": r.trade_count_24h,
             "BID стенки": bid_str,
             "ASK стенки": ask_str,
             "B/A": f"{len(r.bid_walls)}/{len(r.ask_walls)}",
@@ -320,8 +427,27 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
     progress.progress(100, "Готово!")
     time.sleep(0.3)
     progress.empty()
+
+    msg = f"Найдено {len(top_results)} пар"
+    if errors:
+        msg += f" (пропущено {errors})"
+    st.toast(msg)
     if new_movers:
-        st.toast(f"🔄 {len(new_movers)} новых переставок!", icon="⚡")
+        st.toast(f"🔄 {len(new_movers)} переставок!", icon="⚡")
+
+
+# ═══════════════════════════════════════════════════
+# Навигация
+# ═══════════════════════════════════════════════════
+
+PAGES = ["📊 Сканер плотностей", "🔍 Детальный разбор", "📈 Мониторинг переставок"]
+
+
+def go_to_detail(symbol: str):
+    """Устанавливает target_page и symbol, потом rerun"""
+    st.session_state.detail_symbol = symbol
+    st.session_state.target_page = 1  # индекс детальной страницы
+    # НЕ трогаем ключ виджета radio!
 
 
 # ═══════════════════════════════════════════════════
@@ -377,8 +503,6 @@ with st.sidebar:
                         "Цена": w.price, "Объём $": round(w.size_usdt),
                         "Множитель": w.multiplier,
                         "Расстояние %": w.distance_pct,
-                        "Уровней": w.levels_count,
-                        "Mid": r.mid_price, "Спред %": round(r.spread_pct, 2),
                     })
             if all_walls:
                 zf.writestr("all_walls.csv",
@@ -405,8 +529,9 @@ with st.sidebar:
         f"Переставок: {stats['total_mover_events']}"
     )
 
+
 # ═══════════════════════════════════════════════════
-# Скан
+# Запуск скана
 # ═══════════════════════════════════════════════════
 
 if scan_btn or (auto_refresh and time.time() - st.session_state.last_scan > 55):
@@ -414,15 +539,28 @@ if scan_btn or (auto_refresh and time.time() - st.session_state.last_scan > 55):
 
 
 # ═══════════════════════════════════════════════════
-# Навигация — именованные вкладки
+# Вкладки навигации
 # ═══════════════════════════════════════════════════
 
-PAGES = ["📊 Сканер плотностей", "🔍 Детальный разбор", "📈 Мониторинг переставок"]
+# Берём target_page как начальный индекс
+_init_idx = st.session_state.target_page
+if _init_idx < 0 or _init_idx >= len(PAGES):
+    _init_idx = 0
 
 page = st.radio(
-    "nav", PAGES, horizontal=True,
-    key="nav_page", label_visibility="collapsed",
+    "Навигация", PAGES, horizontal=True,
+    index=_init_idx,
+    label_visibility="collapsed",
 )
+
+# Синхронизируем target_page обратно с выбором пользователя
+if page == PAGES[0]:
+    st.session_state.target_page = 0
+elif page == PAGES[1]:
+    st.session_state.target_page = 1
+else:
+    st.session_state.target_page = 2
+
 st.markdown("---")
 
 
@@ -441,28 +579,50 @@ if page == PAGES[0]:
         c1.metric("Найдено", len(results))
         c2.metric("Проверено", st.session_state.total_pairs)
         c3.metric("Лучший", f"⭐ {results[0].score}")
-        c4.metric("С переставками", sum(1 for r in results if r.has_movers))
-        c5.metric("Σ сделок 24ч", f"{sum(getattr(r,'trade_count_24h',0) for r in results):,}")
+        c4.metric("С переставками",
+                  sum(1 for r in results if r.has_movers))
+        total_tc = sum(getattr(r, "trade_count_24h", 0) for r in results)
+        c5.metric("Σ сделок 24ч", f"{total_tc:,}" if total_tc else "—")
 
-        # Выбор монеты → переход к разбору
-        col_s, col_g = st.columns([3, 1])
-        with col_s:
-            opts = [r.symbol for r in results]
-            chosen = st.selectbox("🔍 Выбери пару → детальный разбор",
-                                  [""] + opts, key="scanner_pick")
-        with col_g:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if chosen and st.button("➡️ Открыть", type="primary"):
-                go_to_detail(chosen)
+        # ─── Клик по паре → детальный разбор ───
+        st.markdown("##### 🔍 Выбери пару для детального разбора")
+        opts = [r.symbol for r in results]
 
-        # Таблица
+        # Кнопки-чипы (первые 10)
+        btn_cols = st.columns(min(10, len(opts)))
+        for i, sym in enumerate(opts[:10]):
+            with btn_cols[i]:
+                if st.button(sym, key=f"chip_{sym}", use_container_width=True):
+                    go_to_detail(sym)
+                    st.rerun()
+
+        # Если больше 10 — selectbox для остальных
+        if len(opts) > 10:
+            col_s, col_g = st.columns([3, 1])
+            with col_s:
+                chosen = st.selectbox(
+                    "Или выбери из полного списка",
+                    [""] + opts, key="scanner_pick",
+                )
+            with col_g:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if chosen and st.button("➡️ Открыть", type="primary",
+                                        key="open_detail_btn"):
+                    go_to_detail(chosen)
+                    st.rerun()
+
+        # ─── Таблица ───
         if not scan_df.empty:
-            show_cols = ["Скор", "Пара", "Спред %", "Объём 24ч $",
-                         "Сделок 24ч", "BID стенки", "ASK стенки", "B/A", "🔄"]
+            show_cols = [c for c in [
+                "Скор", "Пара", "Спред %", "Объём 24ч $",
+                "Сделок 24ч", "BID стенки", "ASK стенки", "B/A", "🔄"
+            ] if c in scan_df.columns]
+
             st.dataframe(
                 scan_df[show_cols],
                 column_config={
-                    "Скор": st.column_config.NumberColumn(format="%.1f", width="small"),
+                    "Скор": st.column_config.NumberColumn(
+                        format="%.1f", width="small"),
                     "Спред %": st.column_config.NumberColumn(format="%.2f"),
                     "Объём 24ч $": st.column_config.NumberColumn(format="%d"),
                     "Сделок 24ч": st.column_config.NumberColumn(format="%d"),
@@ -472,6 +632,7 @@ if page == PAGES[0]:
                 use_container_width=True,
                 height=min(len(scan_df) * 38 + 40, 800),
             )
+
             st.download_button(
                 "📥 Скачать результаты (CSV)",
                 data=make_csv(scan_df),
@@ -491,9 +652,11 @@ elif page == PAGES[1]:
     col_a, col_b = st.columns([2, 1])
     with col_a:
         idx = 0
-        if st.session_state.detail_symbol in sym_list:
-            idx = sym_list.index(st.session_state.detail_symbol) + 1
-        target = st.selectbox("Пара", [""] + sym_list, index=idx, key="detail_sel")
+        ds = st.session_state.detail_symbol
+        if ds and ds in sym_list:
+            idx = sym_list.index(ds) + 1
+        target = st.selectbox("Пара", [""] + sym_list, index=idx,
+                              key="detail_sel")
     with col_b:
         manual = st.text_input("Или вручную", placeholder="XYZUSDT")
 
@@ -507,35 +670,44 @@ elif page == PAGES[1]:
     # ─── Загрузка ───
     client = st.session_state.client
     with st.spinner(f"Загружаю {symbol}..."):
-        book = client.get_order_book(symbol, 500)
-        ticker = client.get_ticker_24h(symbol)
-        trades = client.get_recent_trades(symbol, 1000)
-        kl_1h = client.get_klines(symbol, "1h", 100)
-        kl_5m = client.get_klines(symbol, "5m", 100)
-        kl_1m = client.get_klines(symbol, "1m", 100)
+        try:
+            book = client.get_order_book(symbol, 500)
+            ticker_raw = client.get_ticker_24h(symbol)
+            trades = client.get_recent_trades(symbol, 1000)
+            kl_1h = client.get_klines(symbol, "1h", 100)
+            kl_5m = client.get_klines(symbol, "5m", 100)
+            kl_1m = client.get_klines(symbol, "1m", 100)
+        except Exception as e:
+            st.error(f"Ошибка загрузки: {e}")
+            st.stop()
 
     if not book or not book.get("bids") or not book.get("asks"):
-        st.error(f"Не удалось загрузить стакан {symbol}")
+        st.error(f"Нет данных стакана для {symbol}. Проверь тикер.")
         st.stop()
 
     bids_raw = book["bids"]
     asks_raw = book["asks"]
-    best_bid = float(bids_raw[0][0])
-    best_ask = float(asks_raw[0][0])
+    best_bid = sf(bids_raw[0][0])
+    best_ask = sf(asks_raw[0][0])
+
+    if best_bid <= 0 or best_ask <= 0:
+        st.error(f"Некорректные данные для {symbol}")
+        st.stop()
+
     mid_price = (best_bid + best_ask) / 2
     spread_pct = (best_ask - best_bid) / best_bid * 100
-    bid_depth = sum(float(p) * float(q) for p, q in bids_raw)
-    ask_depth = sum(float(p) * float(q) for p, q in asks_raw)
+    bid_depth = sum(sf(p) * sf(q) for p, q in bids_raw)
+    ask_depth = sum(sf(p) * sf(q) for p, q in asks_raw)
 
-    td = ticker if isinstance(ticker, dict) else {}
-    try:
-        trade_count_24h = int(float(td.get("count", 0) or 0))
-    except (ValueError, TypeError):
-        trade_count_24h = 0
-    try:
-        volume_24h = float(td.get("quoteVolume", 0) or 0)
-    except (ValueError, TypeError):
-        volume_24h = 0.0
+    # Парсим тикер — MEXC может вернуть dict или list
+    td = {}
+    if isinstance(ticker_raw, dict):
+        td = ticker_raw
+    elif isinstance(ticker_raw, list) and ticker_raw:
+        td = ticker_raw[0] if isinstance(ticker_raw[0], dict) else {}
+
+    trade_count_24h = extract_trade_count(td)
+    volume_24h = sf(td.get("quoteVolume", 0))
 
     # Заголовок
     h1, h2 = st.columns([3, 1])
@@ -550,32 +722,40 @@ elif page == PAGES[1]:
     m2.metric("Спред", f"{spread_pct:.2f}%")
     m3.metric("Bid глубина", f"${bid_depth:,.0f}")
     m4.metric("Ask глубина", f"${ask_depth:,.0f}")
-    m5.metric("Сделок 24ч", f"{trade_count_24h:,}")
+    m5.metric("Сделок 24ч", f"{trade_count_24h:,}" if trade_count_24h else "—")
     m6.metric("Объём 24ч", f"${volume_24h:,.0f}")
 
     # ─── Сделки по таймфреймам ───
     st.markdown("#### ⏱ Количество сделок")
     tc = st.columns(5)
-    if trades:
+    if trades and isinstance(trades, list) and len(trades) > 0:
         tc[0].metric("5 мин", count_trades_in_window(trades, 5))
         tc[1].metric("15 мин", count_trades_in_window(trades, 15))
         tc[2].metric("1 час", count_trades_in_window(trades, 60))
         tc[3].metric("4 часа", count_trades_in_window(trades, 240))
-        tc[4].metric("24 часа", trade_count_24h)
+        tc[4].metric("24 часа",
+                     f"{trade_count_24h:,}" if trade_count_24h else "—")
 
-        times = [t.get("time", 0) for t in trades if t.get("time")]
+        times = [sf(t.get("time", 0)) for t in trades
+                 if sf(t.get("time", 0)) > 0]
         if len(times) >= 3:
             deltas = [(times[i] - times[i + 1]) / 1000
-                      for i in range(len(times) - 1) if times[i + 1] > 0]
+                      for i in range(len(times) - 1)
+                      if times[i + 1] > 0]
+            deltas = [d for d in deltas if d >= 0]
             if deltas:
                 avg_d = sum(deltas) / len(deltas)
-                robot = " 🤖 **Робот!**" if avg_d < 30 and max(deltas) < 120 else ""
+                robot = (" 🤖 **Робот!**"
+                         if avg_d < 30 and max(deltas) < 120 else "")
                 st.caption(
                     f"Интервалы: ср.={avg_d:.1f}с, "
-                    f"мин={min(deltas):.1f}с, макс={max(deltas):.1f}с{robot}"
+                    f"мин={min(deltas):.1f}с, макс={max(deltas):.1f}с"
+                    f"{robot}"
                 )
+    else:
+        st.caption("Нет данных по сделкам")
 
-    # ─── Графики (вкладки) ───
+    # ─── Графики свечей ───
     st.markdown("#### 📈 Графики")
     t1h, t5m, t1m = st.tabs(["1 час", "5 минут", "1 минута"])
     with t1h:
@@ -599,31 +779,43 @@ elif page == PAGES[1]:
 
     # ─── Стакан ───
     st.markdown("#### 📖 Стакан")
-    depth_v = st.select_slider("Глубина", [20, 30, 50, 100], value=50, key="ob_depth")
+    depth_v = st.select_slider("Глубина",
+                               [20, 30, 50, 100], value=50, key="ob_d")
     fig_ob = build_orderbook_chart(bids_raw, asks_raw, mid_price, depth_v)
-    st.plotly_chart(fig_ob, use_container_width=True)
+    if fig_ob:
+        st.plotly_chart(fig_ob, use_container_width=True)
 
     # ─── Хитмап ───
     fig_hm = build_heatmap(bids_raw, asks_raw, mid_price, 30)
     if fig_hm:
         st.plotly_chart(fig_hm, use_container_width=True)
 
-    # ─── Последние сделки ───
+    # ─── Сделки ───
     trades_df = pd.DataFrame()
-    if trades:
+    if trades and isinstance(trades, list):
         st.markdown("#### 📋 Последние сделки")
         t_rows = []
         for t in trades[:50]:
-            p = float(t.get("price", 0))
-            q = float(t.get("qty", 0))
-            t_rows.append({
-                "Время": pd.to_datetime(t.get("time", 0), unit="ms").strftime("%H:%M:%S"),
-                "Цена": p, "Кол-во": q,
-                "USDT": round(p * q, 2),
-                "Сторона": "🟢 BUY" if not t.get("isBuyerMaker") else "🔴 SELL",
-            })
-        trades_df = pd.DataFrame(t_rows)
-        st.dataframe(trades_df, hide_index=True, use_container_width=True)
+            try:
+                p = sf(t.get("price", 0))
+                q = sf(t.get("qty", 0))
+                ts = sf(t.get("time", 0))
+                t_rows.append({
+                    "Время": pd.to_datetime(
+                        ts, unit="ms"
+                    ).strftime("%H:%M:%S") if ts > 0 else "—",
+                    "Цена": p, "Кол-во": q,
+                    "USDT": round(p * q, 2),
+                    "Сторона": ("🟢 BUY"
+                                if not t.get("isBuyerMaker")
+                                else "🔴 SELL"),
+                })
+            except Exception:
+                continue
+        if t_rows:
+            trades_df = pd.DataFrame(t_rows)
+            st.dataframe(trades_df, hide_index=True,
+                         use_container_width=True)
 
     # ─── Экспорт ───
     st.markdown("---")
@@ -633,41 +825,60 @@ elif page == PAGES[1]:
     ob_rows = []
     for side, data in [("BID", bids_raw), ("ASK", asks_raw)]:
         for p, q in data:
-            ob_rows.append({"Сторона": side, "Цена": float(p),
-                            "Количество": float(q),
-                            "USDT": round(float(p) * float(q), 4)})
+            ob_rows.append({
+                "Сторона": side,
+                "Цена": sf(p), "Количество": sf(q),
+                "USDT": round(sf(p) * sf(q), 4),
+            })
     ob_df = pd.DataFrame(ob_rows)
     export_parts["orderbook"] = ob_df
     if not trades_df.empty:
         export_parts["trades"] = trades_df
-    for label, kdata in [("klines_1h", kl_1h), ("klines_5m", kl_5m), ("klines_1m", kl_1m)]:
-        if kdata:
-            kdf = pd.DataFrame(kdata, columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_volume", "trades", "taker_buy_base",
-                "taker_buy_quote", "ignore"])
-            kdf["time"] = pd.to_datetime(kdf["open_time"], unit="ms")
-            export_parts[label] = kdf
+    for label, kdata in [("klines_1h", kl_1h),
+                         ("klines_5m", kl_5m),
+                         ("klines_1m", kl_1m)]:
+        if kdata and isinstance(kdata, list) and len(kdata) > 0:
+            try:
+                kdf = pd.DataFrame(kdata, columns=[
+                    "open_time", "open", "high", "low", "close",
+                    "volume", "close_time", "quote_volume",
+                    "trades", "taker_buy_base",
+                    "taker_buy_quote", "ignore",
+                ])
+                kdf["time"] = pd.to_datetime(
+                    kdf["open_time"].astype(float), unit="ms")
+                export_parts[label] = kdf
+            except Exception:
+                pass
 
     e1, e2 = st.columns(2)
     with e1:
-        st.download_button("📥 Стакан CSV", data=make_csv(ob_df),
-                           file_name=f"{symbol}_book.csv", mime="text/csv")
+        st.download_button(
+            "📥 Стакан CSV", data=make_csv(ob_df),
+            file_name=f"{symbol}_book.csv", mime="text/csv",
+        )
     with e2:
         if not trades_df.empty:
-            st.download_button("📥 Сделки CSV", data=make_csv(trades_df),
-                               file_name=f"{symbol}_trades.csv", mime="text/csv")
+            st.download_button(
+                "📥 Сделки CSV", data=make_csv(trades_df),
+                file_name=f"{symbol}_trades.csv", mime="text/csv",
+            )
 
     def build_sym_zip():
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, df in export_parts.items():
-                zf.writestr(f"{symbol}_{name}.csv", df.to_csv(index=False))
-            meta = (f"symbol,{symbol}\nmid_price,{mid_price}\n"
-                    f"spread_pct,{spread_pct:.4f}\nbid_depth,{bid_depth:.2f}\n"
-                    f"ask_depth,{ask_depth:.2f}\ntrades_24h,{trade_count_24h}\n"
-                    f"volume_24h,{volume_24h:.2f}\n"
-                    f"timestamp,{datetime.now().isoformat()}\n")
+            for name, edf in export_parts.items():
+                zf.writestr(f"{symbol}_{name}.csv",
+                            edf.to_csv(index=False))
+            meta = (
+                f"symbol,{symbol}\nmid_price,{mid_price}\n"
+                f"spread_pct,{spread_pct:.4f}\n"
+                f"bid_depth,{bid_depth:.2f}\n"
+                f"ask_depth,{ask_depth:.2f}\n"
+                f"trades_24h,{trade_count_24h}\n"
+                f"volume_24h,{volume_24h:.2f}\n"
+                f"timestamp,{datetime.now().isoformat()}\n"
+            )
             zf.writestr(f"{symbol}_meta.csv", meta)
         buf.seek(0)
         return buf.getvalue()
@@ -689,7 +900,7 @@ elif page == PAGES[2]:
     tracker = st.session_state.tracker
 
     st.markdown("""
-    **Переставляш** — плотность, которая перемещается.
+    **Переставляш** — плотность перемещающаяся по стакану.
     Признак робота. Для накопления данных нужно несколько сканов
     (включи авто-обновление 60с).
     """)
@@ -704,7 +915,8 @@ elif page == PAGES[2]:
         m_rows = []
         for e in reversed(movers):
             m_rows.append({
-                "Время": datetime.fromtimestamp(e.timestamp).strftime("%H:%M:%S"),
+                "Время": datetime.fromtimestamp(
+                    e.timestamp).strftime("%H:%M:%S"),
                 "↕": "⬆️" if e.direction == "UP" else "⬇️",
                 "Пара": e.symbol, "Сторона": e.side,
                 "Объём $": round(e.size_usdt),
@@ -713,18 +925,27 @@ elif page == PAGES[2]:
                 "Сдвиг %": round(e.shift_pct, 3),
             })
         mover_df = pd.DataFrame(m_rows)
-        st.dataframe(mover_df, hide_index=True, use_container_width=True,
-                     column_config={"↕": st.column_config.TextColumn(width="small")})
+        st.dataframe(
+            mover_df, hide_index=True, use_container_width=True,
+            column_config={
+                "↕": st.column_config.TextColumn(width="small"),
+            },
+        )
 
+        # Переход к паре
+        unique_syms = list({e.symbol for e in movers})
         col_mp, col_mg = st.columns([3, 1])
         with col_mp:
-            chosen_m = st.selectbox("Выбери пару → разбор",
-                                    [""] + list({e.symbol for e in movers}),
-                                    key="mover_pick")
+            chosen_m = st.selectbox(
+                "Выбери пару → разбор",
+                [""] + sorted(unique_syms),
+                key="mover_pick",
+            )
         with col_mg:
             st.markdown("<br>", unsafe_allow_html=True)
             if chosen_m and st.button("➡️ Открыть", key="mover_go"):
                 go_to_detail(chosen_m)
+                st.rerun()
 
         st.download_button(
             "📥 Переставки CSV",
@@ -741,11 +962,13 @@ elif page == PAGES[2]:
             y=[x[1] for x in top_movers],
             marker_color="#00d2ff",
         ))
-        fig.update_layout(template="plotly_dark", height=300,
-                          xaxis_title="Пара", yaxis_title="Переставок")
+        fig.update_layout(
+            template="plotly_dark", height=300,
+            xaxis_title="Пара", yaxis_title="Переставок",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 
 # Футер
 st.markdown("---")
-st.caption("MEXC Density Scanner v2.1 · Не является финансовой рекомендацией")
+st.caption("MEXC Density Scanner v2.3 · Не является финансовой рекомендацией")

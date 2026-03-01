@@ -72,6 +72,16 @@ class ScanResult:
         return len(self.mover_events) > 0
 
 
+def _safe_float(val, default=0.0) -> float:
+    """Безопасная конвертация в float — MEXC может вернуть '', None, и т.д."""
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 # ═══════════════════════════════════════════════════
 # Анализ стакана
 # ═══════════════════════════════════════════════════
@@ -88,8 +98,18 @@ def analyze_order_book(
     if not bids_raw or not asks_raw:
         return None
 
-    bids = [(float(b[0]), float(b[1])) for b in bids_raw]
-    asks = [(float(a[0]), float(a[1])) for a in asks_raw]
+    try:
+        bids = [(_safe_float(b[0]), _safe_float(b[1])) for b in bids_raw]
+        asks = [(_safe_float(a[0]), _safe_float(a[1])) for a in asks_raw]
+    except (IndexError, KeyError):
+        return None
+
+    # Убираем нулевые цены
+    bids = [(p, q) for p, q in bids if p > 0]
+    asks = [(p, q) for p, q in asks if p > 0]
+
+    if not bids or not asks:
+        return None
 
     best_bid_price = bids[0][0]
     best_ask_price = asks[0][0]
@@ -99,7 +119,7 @@ def analyze_order_book(
         return None
 
     spread_pct = (best_ask_price - best_bid_price) / best_bid_price * 100
-    volume_24h = float(ticker_data.get("quoteVolume", 0))
+    volume_24h = _safe_float(ticker_data.get("quoteVolume", 0))
 
     bid_levels_usdt = [(p, q * p) for p, q in bids]
     ask_levels_usdt = [(p, q * p) for p, q in asks]
