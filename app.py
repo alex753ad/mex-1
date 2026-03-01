@@ -270,7 +270,10 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
         if book:
             result = analyze_order_book(sym, book, ticker)
             if result and result.spread_pct >= min_spread:
-                result.trade_count_24h = int(ticker.get("count", 0))
+                try:
+                    result.trade_count_24h = int(float(ticker.get("count", 0) or 0))
+                except (ValueError, TypeError):
+                    result.trade_count_24h = 0
                 results.append(result)
         if (i + 1) % 5 == 0 or i == total - 1:
             pct = 20 + int((i + 1) / total * 75)
@@ -525,8 +528,14 @@ elif page == PAGES[1]:
     ask_depth = sum(float(p) * float(q) for p, q in asks_raw)
 
     td = ticker if isinstance(ticker, dict) else {}
-    trade_count_24h = int(td.get("count", 0))
-    volume_24h = float(td.get("quoteVolume", 0))
+    try:
+        trade_count_24h = int(float(td.get("count", 0) or 0))
+    except (ValueError, TypeError):
+        trade_count_24h = 0
+    try:
+        volume_24h = float(td.get("quoteVolume", 0) or 0)
+    except (ValueError, TypeError):
+        volume_24h = 0.0
 
     # Заголовок
     h1, h2 = st.columns([3, 1])
