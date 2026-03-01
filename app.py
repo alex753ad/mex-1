@@ -339,21 +339,60 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
         st.error(f"Ошибка API: {e}")
         return
     if not info or "symbols" not in info:
-        st.error("Не удалось загрузить список пар")
+        err = client.last_error or "Пустой ответ"
+        st.error(f"❌ Не удалось загрузить список пар MEXC")
+        st.warning(
+            f"**Причина:** {err}\n\n"
+            f"**Домен:** {client.base_url}\n\n"
+            f"Возможные решения:\n"
+            f"- Подожди 30 секунд и попробуй снова (rate limit)\n"
+            f"- Проверь что MEXC API доступен: "
+            f"https://api.mexc.com/api/v3/ping\n"
+            f"- Если IP заблокирован — используй VPN/VPS"
+        )
+        # Попробуем ping
+        ok, msg = client.ping()
+        if ok:
+            st.info(f"Ping OK ({msg}), но exchangeInfo не отвечает. "
+                     f"Попробуй ещё раз.")
+        else:
+            st.error(f"Ping FAIL: {msg}")
+        progress.empty()
         return
 
     all_symbols = []
     for s in info["symbols"]:
         try:
-            if (s.get("quoteAsset") == "USDT"
-                    and s.get("status") in ("1", "ENABLED", 1, True)
-                    and s.get("isSpotTradingAllowed", True)):
+            if s.get("quoteAsset") != "USDT":
+                continue
+            # MEXC может вернуть status как: "1", 1, "ENABLED", True
+            status = s.get("status", "")
+            status_ok = (str(status) in ("1", "ENABLED", "True", "true")
+                         or status is True or status == 1)
+            trading = s.get("isSpotTradingAllowed", True)
+            if status_ok and trading:
                 all_symbols.append(s["symbol"])
         except Exception:
             continue
 
+    # Если строгий фильтр ничего не дал — пробуем без фильтра статуса
     if not all_symbols:
-        st.error("Нет USDT-пар")
+        for s in info["symbols"]:
+            try:
+                if s.get("quoteAsset") == "USDT":
+                    all_symbols.append(s["symbol"])
+            except Exception:
+                continue
+        if all_symbols:
+            st.warning(f"⚠️ Фильтр статуса не сработал, "
+                       f"взяты все {len(all_symbols)} USDT-пар")
+
+    if not all_symbols:
+        # Может быть другой формат статуса
+        sample = info["symbols"][:3] if info.get("symbols") else []
+        statuses = [str(s.get("status")) for s in sample]
+        st.error(f"Нет USDT-пар. Статусы первых пар: {statuses}")
+        progress.empty()
         return
 
     progress.progress(10, f"{len(all_symbols)} USDT-пар...")
@@ -362,9 +401,11 @@ def run_scan(min_vol, max_vol, min_spread, wall_mult, min_wall_usd, top_n):
         tickers = client.get_all_tickers_24h()
     except Exception as e:
         st.error(f"Ошибка тикеров: {e}")
+        progress.empty()
         return
     if not tickers:
-        st.error("Нет тикеров")
+        st.error(f"Не удалось загрузить тикеры. {client.last_error}")
+        progress.empty()
         return
 
     ticker_map = {}
@@ -558,6 +599,35 @@ with st.sidebar:
         f"Пар: {stats['total_pairs_tracked']} · "
         f"Переставок: {stats['total_mover_events']}"
     )
+
+    # Диагностика
+    if st.button("🔧 Проверить API", use_container_width=True):
+        c = st.session_state.client
+        ok, msg = c.ping()
+        if ok:
+            st.success(f"✅ Ping: {msg}")
+            ok2, msg2 = c.server_time()
+            if ok2:
+                st.success(f"✅ Server time: {msg2}")
+        else:
+            st.error(f"❌ Ping: {msg}")
+            # Пробуем альтернативные домены
+            for domain in ["https://api.mexc.com",
+                           "https://www.mexc.com"]:
+                try:
+                    import requests as _rq
+                    r = _rq.get(f"{domain}/api/v3/ping",
+                                timeout=10,
+                                headers={"User-Agent": "Mozilla/5.0"})
+                    if r.status_code == 200:
+                        st.info(f"✅ {domain} доступен!")
+                        c.base_url = domain
+                        st.success(f"Переключён на {domain}")
+                        break
+                    else:
+                        st.warning(f"❌ {domain}: HTTP {r.status_code}")
+                except Exception as e:
+                    st.warning(f"❌ {domain}: {e}")
 
 # ═══════════════════════════════════════════════════
 # Запуск скана
