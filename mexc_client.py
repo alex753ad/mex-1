@@ -69,6 +69,16 @@ class MexcClientSync:
             "symbol": symbol, "interval": interval, "limit": limit
         })
 
+    def get_agg_trades(self, symbol: str, limit: int = 1000):
+        """Получить агрегированные сделки (до 1000)"""
+        return self._get("/api/v3/aggTrades", {
+            "symbol": symbol, "limit": limit,
+        })
+
+    def get_ticker_24h(self, symbol: str):
+        """24ч статистика одной пары (включает count)"""
+        return self._get("/api/v3/ticker/24hr", {"symbol": symbol})
+
 
 # ═══════════════════════════════════════════════════
 # Асинхронный клиент (для ws_monitor.py на VPS)

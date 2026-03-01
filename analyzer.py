@@ -52,6 +52,7 @@ class ScanResult:
     score: float = 0.0
     mover_events: list[MoverEvent] = field(default_factory=list)
     timestamp: float = 0.0
+    trade_count_24h: int = 0
 
     @property
     def all_walls(self) -> list[WallInfo]:
